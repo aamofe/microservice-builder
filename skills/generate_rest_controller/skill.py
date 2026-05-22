@@ -2,11 +2,11 @@
 skills/generate_rest_controller/skill.py
 Generates a Spring MVC REST controller that delegates to a Dubbo service.
 
-Fix (v2):
-- _normalize_endpoints(): 兼容 LLM 传 http_method/method、method_name/handler_name 等变体键名
-- endpoints 里的 params 字段可缺失，归一化为 []
-- 幂等：已存在的文件不覆盖（overwrite=False）
-- 记录 change_history / controller_classes
+Fix (v3):
+- _build_imports(): 短类名（无 '.'）的参数类型按约定推断为 <base_package>.dto.<Type>
+  解决 UserDto / LoginDto 等 DTO 无法 import 的编译错误
+- source="body" 的参数正确生成 @RequestBody（原 v2 已支持，此版本保持不变）
+- 其余逻辑与 v2 完全一致
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# HTTP 方法名归一化映射（LLM 可能传大写/小写/全名）
 _HTTP_METHOD_NORMALIZE = {
     "get": "Get", "post": "Post", "put": "Put",
     "delete": "Delete", "patch": "Patch",
@@ -29,24 +28,15 @@ _HTTP_METHOD_NORMALIZE = {
 
 
 def _normalize_endpoints(endpoints: list) -> list[dict]:
-    """
-    规范化 endpoints 列表，兼容 LLM 传来的各种键名变体：
-    - http_method / method  →  统一为 http_method（首字母大写，供模板 @{http_method}Mapping 用）
-    - method_name / handler_name / name  →  统一为 method_name
-    - params 缺失  →  补 []
-    - params 里的元素若为字符串  →  {name: str, type: "String", source: "query"}
-    """
     result = []
     for ep in endpoints:
         if not isinstance(ep, dict):
             logger.warning(f"generate_rest_controller: unexpected endpoint format, skipping: {ep!r}")
             continue
 
-        # http_method
         raw_method = ep.get("http_method") or ep.get("method") or "Get"
         http_method = _HTTP_METHOD_NORMALIZE.get(raw_method, raw_method.capitalize())
 
-        # method_name
         method_name = (
             ep.get("method_name")
             or ep.get("handler_name")
@@ -54,7 +44,6 @@ def _normalize_endpoints(endpoints: list) -> list[dict]:
             or "handle"
         )
 
-        # params
         raw_params = ep.get("params") or []
         params = []
         for p in raw_params:
@@ -83,7 +72,6 @@ def run(params: dict, context: ProjectContext) -> dict:
     if not module_name:
         return {"status": "error", "message": "Missing required param: module_name"}
 
-    # controller_name 兼容 class_name
     controller_name: str = (
         params.get("controller_name")
         or params.get("class_name")
@@ -113,7 +101,6 @@ def run(params: dict, context: ProjectContext) -> dict:
 
     out_path = ctrl_dir / f"{controller_name}.java"
 
-    # 幂等检查
     if out_path.exists() and not overwrite:
         logger.info(f"Controller already exists, skipping: {out_path}")
         return {
@@ -123,7 +110,8 @@ def run(params: dict, context: ProjectContext) -> dict:
             "message": f"Controller '{controller_name}' already exists. Use overwrite=true to regenerate.",
         }
 
-    imports = _build_imports(endpoints, dubbo_ref)
+    # ★ v3: pass base_package so _build_imports can resolve short DTO names
+    imports = _build_imports(endpoints, dubbo_ref, base_package)
 
     ctx = {
         "package": ctrl_package,
@@ -157,15 +145,46 @@ def run(params: dict, context: ProjectContext) -> dict:
     }
 
 
-def _build_imports(endpoints: list, dubbo_ref: dict) -> list[str]:
+def _build_imports(endpoints: list, dubbo_ref: dict, base_package: str = "") -> list[str]:
+    """
+    Collect all import statements needed by the controller.
+
+    Rules:
+    - dubbo_ref.interface: always import as-is (it's a FQN)
+    - param types that already contain '.': import as-is (caller passed FQN)
+    - param types without '.': assume they live in <base_package>.dto
+      e.g. "UserDto" → "com.example.userservice.dto.UserDto"
+    - Primitive / well-known types that never need import are skipped.
+    """
+    NO_IMPORT = {
+        "void", "String", "Integer", "Long", "Double", "Float",
+        "Boolean", "Byte", "Short", "Character", "Object",
+        "int", "long", "double", "float", "boolean", "byte", "short", "char",
+    }
+
     imports = []
+
     if dubbo_ref:
         iface = dubbo_ref.get("interface", "")
         if iface:
             imports.append(iface)
+
     for ep in endpoints:
         for p in ep.get("params", []):
-            t = p.get("type", "")
+            t = p.get("type", "").strip()
+            if not t or t in NO_IMPORT:
+                continue
             if "." in t:
+                # Already a FQN
                 imports.append(t)
-    return list(dict.fromkeys(imports))
+            else:
+                # Short name — resolve to <base_package>.dto.<Type>
+                if base_package:
+                    imports.append(f"{base_package}.dto.{t}")
+                    logger.debug(f"_build_imports: resolved '{t}' → '{base_package}.dto.{t}'")
+                else:
+                    logger.warning(
+                        f"_build_imports: cannot resolve short type '{t}' without base_package"
+                    )
+
+    return list(dict.fromkeys(imports))  # deduplicate, preserve order

@@ -2,10 +2,18 @@
 tools/docker_compose_builder.py
 生成并增量更新 docker-compose.yml。
 
-Fix (v3):
-- 还原被覆盖丢失的 DockerComposeBuilder 类
-- is_nacos_container_running() 结果直接写入 GlobalNacosState，
-  确保 ensure_nacos() 能拿到真实状态
+v3 重构要点：
+- 三步走，职责分明：
+    Step A: 网络（_resolve_network）
+      → microservice-net 存在 → external: true
+      → 不存在            → driver: bridge（compose 自动创建）
+    Step B: nacos（ensure_nacos）
+      → 容器真实在跑 → 从 services 里移除，不重复启动
+      → 不在跑       → 加入 services，depends_on 用 service_healthy
+    Step C: 业务服务（add_service）
+      → depends_on nacos 仅在 nacos 被本 compose 管理时才加
+- 去掉 GlobalNacosState 依赖，单一事实来源 = docker inspect
+- 移除过时的 version 字段
 """
 
 from __future__ import annotations
@@ -15,237 +23,204 @@ import subprocess
 from pathlib import Path
 import yaml
 
-from project_context import GlobalNacosState
-
 logger = logging.getLogger(__name__)
+
+NACOS_CONTAINER_NAME = "nacos"
+NETWORK_NAME = "microservice-net"
+
+NACOS_SERVICE = {
+    "image": "nacos/nacos-server:v2.3.0",
+    "container_name": NACOS_CONTAINER_NAME,
+    "environment": {
+        "MODE": "standalone",
+        "NACOS_AUTH_ENABLE": "false",
+        "JVM_XMS": "256m",
+        "JVM_XMX": "512m",
+    },
+    "ports": ["8848:8848", "9848:9848"],
+    "healthcheck": {
+        "test": ["CMD", "curl", "-f", "http://localhost:8848/nacos/actuator/health"],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 10,
+        "start_period": "30s",
+    },
+    "networks": [NETWORK_NAME],
+    "restart": "unless-stopped",
+}
 
 
 class DockerComposeBuilder:
 
-    NACOS_SERVICE = {
-        "image": "nacos/nacos-server:v2.2.3",
-        "container_name": "nacos",
-        "environment": {
-            "MODE": "standalone",
-            "NACOS_AUTH_ENABLE": "false",
-            "JVM_XMS": "256m",
-            "JVM_XMX": "512m",
-        },
-        "ports": ["8848:8848", "9848:9848"],
-        "healthcheck": {
-            "test": ["CMD", "curl", "-f", "http://localhost:8848/nacos/"],
-            "interval": "10s",
-            "timeout": "5s",
-            "retries": 10,
-            "start_period": "30s",
-        },
-        "networks": ["microservice-net"],
-        "restart": "unless-stopped",
-    }
-
-    NETWORK_BRIDGE = {"microservice-net": {"driver": "bridge"}}
-    NETWORK_EXTERNAL = {"microservice-net": {"external": True}}
-
     def __init__(self, project_root: Path):
         self.project_root = project_root
         self.compose_path = project_root / "docker-compose.yml"
-        self._data: dict = self._load_existing()
+        self._data: dict = self._load_or_init()
+        # Will be set by ensure_nacos(); add_service() reads it
+        self._nacos_in_compose: bool = NACOS_CONTAINER_NAME in self._data.get("services", {})
 
-    def _load_existing(self) -> dict:
+    def _load_or_init(self) -> dict:
         if self.compose_path.exists():
             try:
                 with open(self.compose_path) as f:
                     data = yaml.safe_load(f) or {}
-                    data.setdefault("version", "3.8")
-                    data.setdefault("services", {})
-                    data.setdefault("networks", self.NETWORK_BRIDGE)
-                    return data
+                data.setdefault("services", {})
+                # Strip obsolete version field
+                data.pop("version", None)
+                return data
             except Exception as e:
-                logger.warning(f"Failed to load existing compose file: {e}, starting fresh")
-        return {
-            "version": "3.8",
-            "services": {},
-            "networks": self.NETWORK_BRIDGE,
-        }
+                logger.warning(f"Failed to load compose file: {e}, starting fresh")
+        return {"services": {}}
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Nacos 单例处理
+    # Step A: Network
     # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _network_exists() -> bool:
+        """Check whether microservice-net already exists in Docker."""
+        try:
+            result = subprocess.run(
+                ["docker", "network", "inspect", NETWORK_NAME],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _resolve_network(self) -> str:
+        """
+        Decide network declaration for this compose file.
+        Returns "external" or "bridge".
+        - external: network already exists, just reference it
+        - bridge:   network doesn't exist yet, let compose create it
+        """
+        if self._network_exists():
+            logger.info(f"Network '{NETWORK_NAME}' exists → external: true")
+            self._data["networks"] = {
+                NETWORK_NAME: {"external": True}
+            }
+            return "external"
+        else:
+            logger.info(f"Network '{NETWORK_NAME}' not found → driver: bridge (compose will create)")
+            self._data["networks"] = {
+                NETWORK_NAME: {"driver": "bridge"}
+            }
+            return "bridge"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Step B: Nacos
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _nacos_running() -> bool:
+        """True if the nacos container is currently running."""
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Running}}", NACOS_CONTAINER_NAME],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.stdout.strip() == "true"
+        except Exception:
+            return False
 
     def ensure_nacos(self) -> str:
         """
-        保证 Nacos 在某个 compose 文件中存在且只存在一次。
-        返回: "existing" | "added"
+        Step A + B combined (call once).
+
+        1. Resolve network declaration.
+        2. Decide nacos placement:
+           - Running → remove from services (reuse), nacos_action="existing"
+           - Not running → add to services,         nacos_action="added"
+
+        Updates self._nacos_in_compose accordingly (consumed by add_service).
+        Returns: "existing" | "added"
         """
-        # 先做真实探测，同步到 GlobalNacosState（防止状态文件缺失）
-        nacos_actually_running = self.is_nacos_container_running()
-        if nacos_actually_running and not GlobalNacosState.is_running():
-            GlobalNacosState.mark_running(
-                compose_file="external (detected via docker inspect)",
-                network="microservice-net",
-            )
-            logger.info("ensure_nacos: live nacos container detected, GlobalNacosState synced")
+        self._resolve_network()
 
-        nacos_state = GlobalNacosState.get()
-
-        if nacos_state.get("running"):
-            logger.info("Nacos already running (GlobalNacosState), using external network")
-            self._data["networks"] = self.NETWORK_EXTERNAL
-            self._data["services"].pop("nacos", None)
+        if self._nacos_running():
+            logger.info("Nacos container running → reusing, removing from compose services")
+            self._data["services"].pop(NACOS_CONTAINER_NAME, None)
+            self._nacos_in_compose = False
             return "existing"
         else:
-            logger.info("Adding nacos service to docker-compose (first time)")
-            self._data["networks"] = self.NETWORK_BRIDGE
-            self._data["services"]["nacos"] = self.NACOS_SERVICE
+            logger.info("Nacos not running → adding to compose services")
+            self._data["services"][NACOS_CONTAINER_NAME] = NACOS_SERVICE
+            self._nacos_in_compose = True
             return "added"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 服务管理
+    # Step C: Business services
     # ──────────────────────────────────────────────────────────────────────────
 
-    def add_service(
-        self,
-        service_name: str,
-        module_name: str,
-        port: int,
-        image_name: str = None,
-        env_vars: dict = None,
-        depends_on: list[str] = None,
-        registry_mirror: str = None,
-    ) -> str:
+    def add_service(self, service_name: str, module_name: str, port: int,
+                    registry_mirror: str = None) -> str:
         """
-        添加或更新一个微服务。
-        返回: "added" | "updated" | "unchanged"
+        Add or update a business microservice.
+        depends_on nacos only when nacos is managed by this compose file.
+        Returns: "added" | "updated" | "unchanged"
         """
-        image = image_name or f"{module_name}:latest"
-        if registry_mirror:
-            image = f"{registry_mirror}/{image}"
+        image = (
+            f"{registry_mirror}/{module_name}:latest"
+            if registry_mirror
+            else f"{module_name}:latest"
+        )
 
-        default_env = {
-            "NACOS_HOST": "nacos",
-            "NACOS_PORT": "8848",
-            "SERVER_PORT": str(port),
-            "SPRING_PROFILES_ACTIVE": "docker",
+        desired: dict = {
+            "image": image,
+            "build": {"context": f"./{module_name}", "dockerfile": "Dockerfile"},
+            "container_name": module_name,
+            "ports": [f"{port}:{port}"],
+            "environment": {
+                "NACOS_HOST": NACOS_CONTAINER_NAME,
+                "NACOS_PORT": "8848",
+                "SERVER_PORT": str(port),
+                "SPRING_PROFILES_ACTIVE": "docker",
+            },
+            "networks": [NETWORK_NAME],
+            "restart": "on-failure",
         }
-        if env_vars:
-            default_env.update(env_vars)
-
-        nacos_state = GlobalNacosState.get()
-        nacos_is_external = nacos_state.get("running", False)
+        if self._nacos_in_compose:
+            desired["depends_on"] = {
+                NACOS_CONTAINER_NAME: {"condition": "service_healthy"}
+            }
 
         existing = self._data["services"].get(service_name)
+        if existing == desired:
+            return "unchanged"
 
-        if existing:
-            existing_env = existing.get("environment", {})
-            merged_env = {**default_env, **existing_env}
-            changed = (
-                existing_env != merged_env
-                or existing.get("ports") != [f"{port}:{port}"]
-            )
-            if not changed:
-                logger.info(f"Service '{service_name}' unchanged, skipping")
-                return "unchanged"
-            existing["environment"] = merged_env
-            existing["ports"] = [f"{port}:{port}"]
-            if nacos_is_external:
-                existing.pop("depends_on", None)
-            else:
-                existing["depends_on"] = {"nacos": {"condition": "service_healthy"}}
-            logger.info(f"Updated existing service: {service_name}")
-            return "updated"
-        else:
-            svc: dict = {
-                "image": image,
-                "build": {
-                    "context": f"./{module_name}",
-                    "dockerfile": "Dockerfile",
-                },
-                "container_name": module_name,
-                "ports": [f"{port}:{port}"],
-                "environment": default_env,
-                "networks": ["microservice-net"],
-                "restart": "on-failure",
-            }
-            if not nacos_is_external:
-                svc["depends_on"] = {"nacos": {"condition": "service_healthy"}}
-
-            self._data["services"][service_name] = svc
-            logger.info(f"Added new service: {service_name}")
-            return "added"
-
-    def remove_service(self, service_name: str):
-        self._data.get("services", {}).pop(service_name, None)
+        self._data["services"][service_name] = desired
+        return "updated" if existing else "added"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 持久化
+    # Dockerfile
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def generate_dockerfile(self, module_path: Path, port: int, overwrite: bool = False) -> bool:
+        dockerfile = module_path / "Dockerfile"
+        if dockerfile.exists() and not overwrite:
+            return False
+        dockerfile.write_text(
+            f"FROM eclipse-temurin:17-jre-alpine\n"
+            f"WORKDIR /app\n"
+            f"COPY target/*.jar app.jar\n"
+            f"EXPOSE {port}\n"
+            f'ENTRYPOINT ["java", "-jar", "app.jar"]\n'
+        )
+        logger.info(f"Dockerfile written: {dockerfile}")
+        return True
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Persist
     # ──────────────────────────────────────────────────────────────────────────
 
     def save(self):
         self.compose_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.compose_path, "w") as f:
             yaml.dump(
-                self._data,
-                f,
+                self._data, f,
                 default_flow_style=False,
                 sort_keys=False,
                 allow_unicode=True,
             )
         logger.info(f"docker-compose.yml saved: {self.compose_path}")
-
-    def to_yaml(self) -> str:
-        return yaml.dump(self._data, default_flow_style=False, sort_keys=False)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Dockerfile（幂等）
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def generate_dockerfile(self, module_path: Path, port: int, overwrite: bool = False) -> bool:
-        dockerfile = module_path / "Dockerfile"
-        if dockerfile.exists() and not overwrite:
-            logger.info(f"Dockerfile already exists, skipping: {dockerfile}")
-            return False
-        content = f"""\
-FROM eclipse-temurin:17-jre-alpine
-WORKDIR /app
-COPY target/*.jar app.jar
-EXPOSE {port}
-ENTRYPOINT ["java", "-jar", "app.jar"]
-"""
-        dockerfile.write_text(content)
-        logger.info(f"Dockerfile written: {dockerfile}")
-        return True
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 运行状态检测
-    # ──────────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def is_nacos_container_running() -> bool:
-        """
-        通过 docker inspect 检查名为 'nacos' 的容器是否正在运行。
-        不依赖 GlobalNacosState（用于初始化时的真实状态探测）。
-        """
-        try:
-            result = subprocess.run(
-                ["docker", "inspect", "--format", "{{.State.Running}}", "nacos"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            return result.stdout.strip() == "true"
-        except Exception:
-            return False
-
-    @staticmethod
-    def is_nacos_network_exists() -> bool:
-        """检查 docker 网络 microservice-net 是否已存在。"""
-        try:
-            result = subprocess.run(
-                ["docker", "network", "ls", "--filter", "name=microservice-net", "--format", "{{.Name}}"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            return "microservice-net" in result.stdout
-        except Exception:
-            return False

@@ -481,7 +481,7 @@ class ProjectContext:
     def module_path(self, module_name: str) -> Path:
         return self.project_root / module_name
 
-    def next_available_port(self, start: int = 8081) -> int:
+    def next_available_port(self, start: int = 8051) -> int:
         used = {m.port for m in self.modules.values()}
         p = start
         while p in used:

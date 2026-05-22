@@ -36,6 +36,7 @@ CURRENT_PROJECT: str | None = None
 # ──────────────────────────────────────────────────────────────────────────────
 
 SKILL_REQUIRED_PARAMS: dict[str, list[str]] = {
+    # ★ port 从必填列表移除：skill 层强制忽略 LLM 传入的 port，由系统自动分配
     "create_spring_boot_module": ["module_name"],
     "generate_dubbo_interface":  ["module_name", "interface_name", "methods"],
     "generate_entity":           ["module_name", "class_name"],
@@ -45,18 +46,23 @@ SKILL_REQUIRED_PARAMS: dict[str, list[str]] = {
     "update_docker_compose":     [],
     "modify_dubbo_config":       ["module_name"],
     "update_nacos_config":       [],
+    "generate_dto":              ["module_name", "class_name"],
 }
 
 # skill description 内联摘要，注入到 SkillRunnerTool.description（LLM 可见）
 _SKILL_PARAM_HINTS = """
 Required params per skill (ALL must be in the params JSON):
-  create_spring_boot_module : module_name(str), port(int)
+  create_spring_boot_module : module_name(str)
+                              *** DO NOT pass port — it is auto-assigned by the system.
+                              *** The response will include `assigned_port`; use that value
+                              *** in all subsequent skill calls for this module.
   generate_dubbo_interface  : module_name(str), interface_name(str), methods(list[{name,return_type,params}])
   generate_entity           : module_name(str), class_name(str), fields(list[{name,type}])
   generate_rest_controller  : module_name(str), controller_name(str), base_path(str), endpoints(list[{http_method,path,method_name,params}])
   add_threadpool_config     : module_name(str)
   incremental_modify        : module_name(str), target_class(str), operations(list)
   update_docker_compose     : (no required params)
+  generate_dto              : module_name(str), class_name(str), fields(list[{name,type}])
 """
 
 
@@ -235,6 +241,17 @@ class SkillRunnerTool(BaseTool):
         except json.JSONDecodeError as e:
             return json.dumps({"status": "error", "message": f"Invalid JSON params: {e}"})
 
+        # ★ 自动重定向：LLM 用 generate_entity 生成 DTO 时强制转为 generate_dto
+        _DTO_SUFFIXES = ("DTO", "Dto", "Request", "Response", "Vo", "VO", "Form")
+        if skill_name == "generate_entity":
+            class_name = p.get("class_name") or p.get("entity_name") or p.get("name") or ""
+            if any(class_name.endswith(s) for s in _DTO_SUFFIXES):
+                logger.info(
+                    f"Auto-redirect: generate_entity(class_name='{class_name}') "
+                    f"→ generate_dto (DTO suffix detected)"
+                )
+                skill_name = "generate_dto"
+
         # 3. ★ 前置参数校验（新增）
         param_err = _validate_skill_params(skill_name, p)
         if param_err:
@@ -319,7 +336,7 @@ def build_agents(llm_config: dict = None) -> dict[str, Agent]:
         tools=TOOLS,
         verbose=True,
         allow_delegation=False,
-        max_iter=5,
+        max_iter=20,
         **(llm_config or {}),
     )
 
@@ -350,8 +367,10 @@ def build_agents(llm_config: dict = None) -> dict[str, Agent]:
             You are a Java platform architect. Rules:
             1. Call get_project_state(project_name='{CURRENT_PROJECT}') ONCE to check ports.
             2. Assign new ports starting from max_existing_port + 1.
-            3. Output the architecture JSON immediately. Do NOT loop.
-            4. project_name in ALL tool calls MUST be '{CURRENT_PROJECT}'.
+            3. Port assignment: start from 8051, increment by 1 for each new module. NEVER use 8080, 8081, 8082.
+            4. Output the architecture JSON immediately. Do NOT loop.
+            5. project_name in ALL tool calls MUST be '{CURRENT_PROJECT}'.
+
         """),
         **shared,
     )
@@ -370,6 +389,9 @@ def build_agents(llm_config: dict = None) -> dict[str, Agent]:
             2. Call skills in order: create_spring_boot_module → generate_dubbo_interface
                → generate_entity → generate_rest_controller → add_threadpool_config.
             3. CRITICAL param rules:
+                - DTO RULE: if any endpoint param type ends with 'Dto'/'Request'/'Response',
+                call generate_dto FIRST for each such type, THEN generate_rest_controller.
+                DTO fields: derive from semantics (UserDto → username:String, password:String).
                - module_name: use the EXACT name from create_spring_boot_module result
                - generate_entity: use 'class_name' key (NOT 'entity_name'), do NOT include 'id' in fields
                - generate_dubbo_interface: methods must be list of dict {{name, return_type, params:[{{name,type}}]}}
@@ -493,7 +515,7 @@ def build_tasks(agents: dict[str, Agent], user_request: str, project_name: str) 
 
             规则（最多调用工具1次）:
             1. 调用 get_project_state(project_name="{project_name}") — 只调用一次
-            2. 从现有最大端口 +1 开始分配新端口
+            2. 从现有最大端口 +1 开始分配新端口。也就是从 8051 开始分配端口，每个新模块递增1。不得使用 8080/8081/8082。
             3. 立即输出架构 JSON（不再调用任何工具）:
             {{
               "group_id": "com.example",
@@ -522,11 +544,12 @@ def build_tasks(agents: dict[str, Agent], user_request: str, project_name: str) 
             - generate_rest_controller 必须用 "controller_name" 键，endpoints 用 http_method/path/method_name
 
             技能调用顺序（每个模块依次执行）:
-              1. create_spring_boot_module  → 记录返回的 module_name 用于后续调用
-              2. generate_dubbo_interface
-              3. generate_entity（如有实体）
-              4. generate_rest_controller
-              5. add_threadpool_config（仅 has_threadpool=true）
+              1. create_spring_boot_module
+            2. generate_dubbo_interface
+            3. generate_entity（如有 JPA 实体）
+            4. generate_dto（如有 DTO 类型的 endpoint 参数）
+            5. generate_rest_controller
+            6. add_threadpool_config（仅 has_threadpool=true）
 
             所有调用都包含 project_name='{project_name}'。
         """),

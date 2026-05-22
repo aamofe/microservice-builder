@@ -1,10 +1,10 @@
 """
 main.py
 Usage: 
-    python main.py create --project my-shop --request "Create a user-service (login, register) and an order-service (create order). Order-service must validate user via user-service before processing orders."
+    PYTHONUNBUFFERED=1 python main.py create   --project my-shop   --request "Create a user-service (login, register) and an order-service (create order). Order-service must validate user via user-service before processing orders."   > log.txt 2>&1
     python main.py modify --project my-shop --request "Add order history method to OrderService" 
     python main.py status --project my-shop python main.py skill list 
-    python main.py skill run create_spring_boot_module --project my-shop --params '{"module_name":"service-user","port":8081}'
+    python main.py skill run create_spring_boot_module --project my-shop --params '{"module_name":"service-user","port":8051}'
 """
 
 from __future__ import annotations
@@ -82,7 +82,9 @@ def modify(project: str, request: str):
 
 def _run_crew(request: str, project_name: str):
     from crew import run_crew
+    from project_context import GlobalNacosState
 
+    GlobalNacosState.get()  # 内部会做 docker inspect 兜底
 
     console.print(
         Panel(
@@ -225,7 +227,7 @@ def docker(project: str):
 
     console.print("\n[bold]Start services:[/bold]")
     console.print(f"  cd {output_root}")
-    console.print("  docker-compose up -d")
+    console.print("  docker compose up -d")
 
     ContextRegistry.close_all()
 

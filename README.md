@@ -107,11 +107,11 @@ python main.py modify \
 
 ```bash
 cd output/my-shop
-docker-compose up -d
+docker compose up -d
 
 # Nacos 控制台:  http://localhost:8848/nacos  (nacos/nacos)
-# User 服务:     http://localhost:8081/actuator/health
-# Order 服务:    http://localhost:8082/actuator/health
+# User 服务:     http://localhost:8051/actuator/health
+# Order 服务:    http://localhost:8052/actuator/health
 ```
 
 ### 6. 新增微服务（Nacos 已运行时）
@@ -241,3 +241,9 @@ output/
 
 sudo apt update
 sudo apt install -y maven
+
+cd output/my-shop
+
+mvn clean package -DskipTests
+
+docker compose up -d

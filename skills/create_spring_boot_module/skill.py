@@ -2,10 +2,11 @@
 skills/create_spring_boot_module/skill.py
 创建新的 Spring Boot + Dubbo + Nacos 模块。
 
-v2 核心变更：
-- 幂等检查：module 已存在时返回 "already_exists"，不覆盖现有文件
-- 每个生成的文件都记录到 context.log_change()
-- Application.java / application.yml 只在文件不存在时写入
+v3 核心变更：
+- 强制忽略 LLM 传入的 port，统一由 context.next_available_port() 分配
+  （防止 LLM 误用 8081/8082 等已占用端口）
+- 返回值中明确携带 assigned_port，让 LLM 知晓实际分配的端口
+- 其余逻辑不变
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ def run(params: dict, context: ProjectContext) -> dict:
             "module_name": module_name,
             "path": str(context.module_path(module_name)),
             "port": existing.port,
+            "assigned_port": existing.port,
             "base_package": existing.base_package,
             "message": (
                 f"Module '{module_name}' already exists (port={existing.port}, "
@@ -53,7 +55,16 @@ def run(params: dict, context: ProjectContext) -> dict:
     base_package: str = params.get("base_package") or (
         group_id + "." + re.sub(r"[^a-zA-Z0-9]", "", module_name)
     )
-    port: int = int(params.get("port") or context.next_available_port())
+
+    # ★ 强制忽略 LLM 传入的 port，统一由系统分配
+    #   防止 LLM 使用 8081/8082 等已被占用的端口
+    if "port" in params and params["port"] is not None:
+        logger.warning(
+            f"Ignoring LLM-provided port={params['port']} for module '{module_name}'. "
+            f"Port is always auto-assigned by context.next_available_port()."
+        )
+    port: int = context.next_available_port()
+
     has_async: bool = bool(params.get("has_async", False))
     has_threadpool: bool = bool(params.get("has_threadpool", False))
     module_dependencies: list = params.get("module_dependencies", [])
@@ -188,7 +199,11 @@ def run(params: dict, context: ProjectContext) -> dict:
         "module_name": module_name,
         "path": str(module_path),
         "port": port,
+        "assigned_port": port,   # ★ 明确告知 LLM 实际分配的端口
         "base_package": base_package,
         "created_files": created_files,
-        "message": f"Module '{module_name}' created at {module_path} ({len(created_files)} files)",
+        "message": (
+            f"Module '{module_name}' created at {module_path} ({len(created_files)} files). "
+            f"Assigned port: {port}. Use this port in all subsequent references."
+        ),
     }

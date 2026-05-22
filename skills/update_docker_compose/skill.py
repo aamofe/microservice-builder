@@ -1,23 +1,25 @@
 """
 skills/update_docker_compose/skill.py
-生成或增量更新 docker-compose.yml。
+生成/更新 docker-compose.yml，执行 mvn package，启动容器。
 
-v2 核心逻辑：
-1. 先通过 docker inspect 检测 nacos 容器是否真实运行 → 同步到 GlobalNacosState
-2. ensure_nacos() 根据全局状态决定：新增 nacos service 还是 external 网络复用
-3. 每个 module 的 service 幂等添加（已存在只更新 env/ports）
-4. save() 后若是首次添加 nacos，标记 GlobalNacosState.mark_running()
-5. 记录变更到 context.log_change()
+v3 流程（与 DockerComposeBuilder v3 对应）：
+  Step 1 (A+B): ensure_nacos()  — 解析网络 + 决定 nacos 放置
+  Step 2 (C):   add_service()   — 为每个模块添加/更新 service
+  Step 3:       save()          — 写入 docker-compose.yml
+  Step 4:       mvn clean package
+  Step 5:       docker compose up -d --build --remove-orphans
+                ↑ 用 --remove-orphans 替代先 down 再 up，
+                  避免把外部 nacos 容器误 down 掉
 """
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
-
-from project_context import ProjectContext, GlobalNacosState
-from tools.docker_compose_builder import DockerComposeBuilder
+import subprocess
 import logging
+
+from project_context import ProjectContext
+from tools.docker_compose_builder import DockerComposeBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -28,26 +30,10 @@ def run(params: dict, context: ProjectContext) -> dict:
 
     builder = DockerComposeBuilder(context.project_root)
 
-    # ----------------------------------------------------------------
-    # Step 1: 真实检测 nacos 运行状态，同步到全局 state
-    # ----------------------------------------------------------------
-    nacos_actually_running = DockerComposeBuilder.is_nacos_container_running()
-    if nacos_actually_running and not GlobalNacosState.is_running():
-        # docker 里确实有 nacos 容器，但全局 state 未记录 → 补充标记
-        GlobalNacosState.mark_running(
-            compose_file="external (detected via docker inspect)",
-            network="microservice-net",
-        )
-        logger.info("Detected running nacos container, marked in GlobalNacosState")
+    # ── Step 1: 网络 + nacos ──────────────────────────────────────────
+    nacos_action = builder.ensure_nacos()
 
-    # ----------------------------------------------------------------
-    # Step 2: 确保 nacos 配置存在（新增 or 复用）
-    # ----------------------------------------------------------------
-    nacos_action = builder.ensure_nacos()   # "added" | "existing"
-
-    # ----------------------------------------------------------------
-    # Step 3: 为每个 module 添加/更新 service
-    # ----------------------------------------------------------------
+    # ── Step 2: 业务服务 ──────────────────────────────────────────────
     results = {}
     for module_name, module_info in context.modules.items():
         action = builder.add_service(
@@ -57,13 +43,11 @@ def run(params: dict, context: ProjectContext) -> dict:
             registry_mirror=registry_mirror,
         )
         results[module_name] = action
-
-        # 生成 Dockerfile（幂等）
-        module_path = context.module_path(module_name)
-        dockerfile_written = builder.generate_dockerfile(
-            module_path, module_info.port, overwrite=force_dockerfile
+        builder.generate_dockerfile(
+            context.module_path(module_name),
+            module_info.port,
+            overwrite=force_dockerfile,
         )
-
         if action in ("added", "updated"):
             context.log_change(
                 module_name=module_name,
@@ -72,49 +56,41 @@ def run(params: dict, context: ProjectContext) -> dict:
                 description=f"docker-compose service {action}: {module_name} port={module_info.port}",
             )
 
-    # ----------------------------------------------------------------
-    # Step 4: 保存
-    # ----------------------------------------------------------------
+    # ── Step 3: 保存 ──────────────────────────────────────────────────
     builder.save()
 
-    # Step 5: 如果本次新增了 nacos service，标记全局 state
-    if nacos_action == "added":
-        GlobalNacosState.mark_running(
-            compose_file=str(context.project_root / "docker-compose.yml"),
-            network="microservice-net",
-        )
+    # ── Step 4: mvn clean package ─────────────────────────────────────
+    mvn = subprocess.run(
+        ["mvn", "clean", "package", "-DskipTests", "-q", "--no-transfer-progress"],
+        cwd=str(context.project_root),
+        capture_output=True, text=True,
+    )
+    if mvn.returncode != 0:
+        logger.error(f"mvn package failed:\n{mvn.stderr}")
+        return {"status": "error", "message": f"mvn package failed: {mvn.stderr[-800:]}"}
+    logger.info("mvn clean package succeeded")
 
-    compose_path = str(context.project_root / "docker-compose.yml")
+    # ── Step 5: docker compose up（--remove-orphans 处理旧容器）────────
+    #   不做 compose down，避免影响外部 nacos 容器
+    up = subprocess.run(
+        ["docker", "compose", "up", "-d", "--build", "--remove-orphans"],
+        cwd=str(context.project_root),
+        capture_output=True, text=True,
+    )
+    if up.returncode != 0:
+        logger.error(f"docker compose up failed:\n{up.stderr}")
+        return {"status": "error", "message": f"docker compose up failed: {up.stderr[-800:]}"}
+    logger.info("docker compose up -d --build --remove-orphans succeeded")
 
     return {
         "status": "success",
-        "compose_file": compose_path,
-        "nacos_action": nacos_action,          # "added" | "existing"
-        "services": results,                    # {module_name: "added"|"updated"|"unchanged"}
-        "message": _build_message(nacos_action, results, context.project_root),
+        "compose_file": str(context.project_root / "docker-compose.yml"),
+        "nacos_action": nacos_action,
+        "services": results,
+        "deployed": True,
+        "message": (
+            f"Nacos: {'reused (external)' if nacos_action == 'existing' else 'started (in compose)'}. "
+            f"Services deployed: {', '.join(results.keys())}. "
+            f"Access Nacos: http://localhost:8848/nacos (nacos/nacos)"
+        ),
     }
-
-
-def _build_message(nacos_action: str, services: dict, project_root: Path) -> str:
-    lines = []
-    if nacos_action == "existing":
-        lines.append("✓ Nacos: 复用已运行的 nacos 容器（未重复声明）")
-    else:
-        lines.append("✓ Nacos: 已加入 docker-compose（首次）")
-
-    for svc, action in services.items():
-        symbol = {"added": "+", "updated": "~", "unchanged": "="}[action]
-        lines.append(f"  [{symbol}] {svc} ({action})")
-
-    lines.append("")
-    lines.append(f"docker-compose.yml: {project_root / 'docker-compose.yml'}")
-    lines.append("")
-    lines.append("启动命令:")
-    if nacos_action == "existing":
-        lines.append(f"  cd {project_root}")
-        lines.append("  docker-compose up -d   # nacos 已在运行，只启动业务服务")
-    else:
-        lines.append(f"  cd {project_root}")
-        lines.append("  docker-compose up -d   # 含 nacos + 所有服务")
-    lines.append("  # Nacos 控制台: http://localhost:8848/nacos  (nacos/nacos)")
-    return "\n".join(lines)
