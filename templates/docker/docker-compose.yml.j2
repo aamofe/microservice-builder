@@ -1,0 +1,42 @@
+version: "3.8"
+
+networks:
+  microservice-net:
+    driver: bridge
+
+services:
+  nacos:
+    image: nacos/nacos-server:v2.3.0
+    container_name: nacos-standalone
+    environment:
+      - MODE=standalone
+      - NACOS_AUTH_ENABLE=false
+    ports:
+      - "8848:8848"
+      - "9848:9848"
+    networks:
+      - microservice-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8848/nacos/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+{% for service_name, service in services.items() %}
+  {{ service_name }}:
+    build:
+      context: ./{{ service_name }}
+      dockerfile: Dockerfile
+    container_name: {{ service_name }}
+    ports:
+      - "{{ service.port }}:{{ service.port }}"
+    environment:
+      - NACOS_HOST=nacos
+      - NACOS_PORT=8848
+      - SERVER_PORT={{ service.port }}
+    networks:
+      - microservice-net
+    depends_on:
+      nacos:
+        condition: service_healthy
+{% endfor %}

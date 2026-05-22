@@ -1,0 +1,20 @@
+package {{ base_package }};
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+{% if has_async %}
+import org.springframework.scheduling.annotation.EnableAsync;
+{% endif %}
+import org.apache.dubbo.config.spring.context.annotation.EnableDubbo;
+
+@SpringBootApplication
+@EnableDubbo
+{% if has_async %}
+@EnableAsync
+{% endif %}
+public class {{ class_name }}Application {
+
+    public static void main(String[] args) {
+        SpringApplication.run({{ class_name }}Application.class, args);
+    }
+}

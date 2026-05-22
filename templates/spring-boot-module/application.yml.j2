@@ -1,0 +1,25 @@
+server:
+  port: {{ port }}
+
+spring:
+  application:
+    name: {{ module_name }}
+
+dubbo:
+  application:
+    name: {{ module_name }}
+  registry:
+    address: nacos://{{ nacos_host }}:{{ nacos_port }}
+  protocol:
+    name: dubbo
+    port: {{ dubbo_port }}
+  scan:
+    base-packages: {{ base_package }}
+  consumer:
+    timeout: 5000
+    retries: 2
+
+logging:
+  level:
+    root: INFO
+    {{ base_package }}: DEBUG
