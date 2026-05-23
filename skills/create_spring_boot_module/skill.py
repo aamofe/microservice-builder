@@ -1,12 +1,11 @@
 """
 skills/create_spring_boot_module/skill.py
-创建新的 Spring Boot + Dubbo + Nacos 模块。
 
-v3 核心变更：
-- 强制忽略 LLM 传入的 port，统一由 context.next_available_port() 分配
-  （防止 LLM 误用 8081/8082 等已占用端口）
-- 返回值中明确携带 assigned_port，让 LLM 知晓实际分配的端口
-- 其余逻辑不变
+v4 变更：
+- nacos_host 默认值从 "localhost" 改为 "nacos"
+  理由：生成的 application.yml 会被打进 Docker 镜像，容器内必须用服务名 "nacos"
+  访问 Nacos，而不是 localhost。本地直接运行可通过环境变量 NACOS_HOST=localhost 覆盖。
+- port 继续强制忽略 LLM 传入值，由 context.next_available_port() 分配（v3 已有）
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ def run(params: dict, context: ProjectContext) -> dict:
     module_name: str = params["module_name"]
 
     # ----------------------------------------------------------------
-    # 幂等检查：module 是否已存在
+    # 幂等检查
     # ----------------------------------------------------------------
     if context.module_exists(module_name):
         existing = context.modules[module_name]
@@ -57,7 +56,6 @@ def run(params: dict, context: ProjectContext) -> dict:
     )
 
     # ★ 强制忽略 LLM 传入的 port，统一由系统分配
-    #   防止 LLM 使用 8081/8082 等已被占用的端口
     if "port" in params and params["port"] is not None:
         logger.warning(
             f"Ignoring LLM-provided port={params['port']} for module '{module_name}'. "
@@ -116,8 +114,9 @@ def run(params: dict, context: ProjectContext) -> dict:
 
     # ----------------------------------------------------------------
     # application.yml
+    # ★ nacos_host 默认 "nacos"（容器服务名），本地开发可通过 NACOS_HOST=localhost 覆盖
     # ----------------------------------------------------------------
-    nacos_host = os.getenv("NACOS_HOST", "localhost")
+    nacos_host = os.getenv("NACOS_HOST", "nacos")
     nacos_port = int(os.getenv("NACOS_PORT", 8848))
     dubbo_port = port + 10000
     yml_ctx = {
@@ -185,7 +184,6 @@ def run(params: dict, context: ProjectContext) -> dict:
     context.set_kv("group_id", group_id)
     context.set_kv("version", version)
 
-    # 记录变更历史
     context.log_change(
         module_name=module_name,
         file_path=".",
@@ -199,7 +197,7 @@ def run(params: dict, context: ProjectContext) -> dict:
         "module_name": module_name,
         "path": str(module_path),
         "port": port,
-        "assigned_port": port,   # ★ 明确告知 LLM 实际分配的端口
+        "assigned_port": port,
         "base_package": base_package,
         "created_files": created_files,
         "message": (

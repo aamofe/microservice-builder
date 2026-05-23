@@ -58,12 +58,27 @@ Required params per skill (ALL must be in the params JSON):
                               *** in all subsequent skill calls for this module.
   generate_dubbo_interface  : module_name(str), interface_name(str), methods(list[{name,return_type,params}])
   generate_entity           : module_name(str), class_name(str), fields(list[{name,type}])
-  generate_rest_controller  : module_name(str), controller_name(str), base_path(str), endpoints(list[{http_method,path,method_name,params}])
+  generate_rest_controller  : module_name(str), controller_name(str), base_path(str),
+                              endpoints(list[{http_method,path,method_name,params}])
+                              *** If this module calls a Dubbo service from another module,
+                              *** you MUST pass dubbo_ref:
+                              ***   dubbo_ref = {
+                              ***     "interface": "<fully.qualified.InterfaceName>",
+                              ***     "field_name": "<camelCase field name in controller>"
+                              ***   }
+                              *** This injects @DubboReference into the controller so the
+                              *** consumer can discover the provider via Nacos.
+                              *** Example: order-service calling user-service:
+                              ***   dubbo_ref = {
+                              ***     "interface": "com.example.userservice.api.UserService",
+                              ***     "field_name": "userService"
+                              ***   }
   add_threadpool_config     : module_name(str)
   incremental_modify        : module_name(str), target_class(str), operations(list)
   update_docker_compose     : (no required params)
   generate_dto              : module_name(str), class_name(str), fields(list[{name,type}])
 """
+ 
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -386,19 +401,45 @@ def build_agents(llm_config: dict = None) -> dict[str, Agent]:
         backstory=dedent(f"""\
             You are a code generation engine. Rules:
             1. project_name in ALL skill calls MUST be '{CURRENT_PROJECT}'.
-            2. Call skills in order: create_spring_boot_module → generate_dubbo_interface
-               → generate_entity → generate_rest_controller → add_threadpool_config.
-            3. CRITICAL param rules:
-                - DTO RULE: if any endpoint param type ends with 'Dto'/'Request'/'Response',
-                call generate_dto FIRST for each such type, THEN generate_rest_controller.
-                DTO fields: derive from semantics (UserDto → username:String, password:String).
-               - module_name: use the EXACT name from create_spring_boot_module result
-               - generate_entity: use 'class_name' key (NOT 'entity_name'), do NOT include 'id' in fields
-               - generate_dubbo_interface: methods must be list of dict {{name, return_type, params:[{{name,type}}]}}
-               - generate_rest_controller: use 'controller_name' key, endpoints need http_method/path/method_name
-            4. If skill returns param_error: fix the params and re-call ONCE more. Then move on.
-            5. If skill returns already_exists: skip, do not retry.
-            6. If skill returns final_error (not param_error): record and move to next item.
+            2. Call skills in this EXACT order for EVERY module:
+               create_spring_boot_module
+               → generate_dubbo_interface   (if module exposes a Dubbo service)
+               → generate_entity            (if module has JPA entities)
+               → generate_dto               (MANDATORY for EVERY DTO type referenced anywhere)
+               → generate_rest_controller
+               → add_threadpool_config      (only if has_threadpool=true)
+ 
+            3. DTO RULE — NON-NEGOTIABLE:
+               Before calling generate_rest_controller for ANY module, scan ALL endpoint
+               param types AND all Dubbo interface method param types.
+               For EVERY type that is not a Java primitive or String
+               (e.g. UserDTO, OrderDTO, LoginRequest, CreateOrderRequest):
+                 - Call generate_dto for that type in the module that OWNS it.
+                 - UserDTO lives in user-service, OrderDTO lives in order-service.
+               Do NOT skip generate_dto even if you think the type is simple.
+               Missing DTO = compilation failure.
+ 
+            4. CONSUMER RULE — NON-NEGOTIABLE:
+               If a module calls another module's Dubbo service, pass dubbo_ref to
+               generate_rest_controller:
+                 dubbo_ref = {{
+                   "interface": "<interface_fqn from generate_dubbo_interface result>",
+                   "field_name": "<camelCase field name>"
+                 }}
+               The skill will automatically add the provider as a Maven dependency.
+               Never skip dubbo_ref for a consumer module.
+ 
+            5. Other param rules:
+               - DO NOT pass port to create_spring_boot_module. Read assigned_port from result.
+               - generate_entity: key is 'class_name' (not entity_name), no 'id' in fields.
+               - generate_dubbo_interface: methods = list of
+                 {{name, return_type, params:[{{name,type}}]}}.
+               - generate_rest_controller: key is 'controller_name'.
+ 
+            6. Error handling:
+               - param_error → fix and re-call once, then move on.
+               - already_exists → skip.
+               - final_error (runtime) → record and move to next item.
         """),
         **shared,
     )
@@ -532,26 +573,39 @@ def build_tasks(agents: dict[str, Agent], user_request: str, project_name: str) 
     t3 = Task(
         description=dedent(f"""\
             为 project '{project_name}' 生成【新建】部分的代码。
-
-            ⚠️  project_name = "{project_name}" — 所有 skill 调用的 project_name 必须是此值。
-            ⚠️  参数错误（error_type=param_error）时：修正参数后立即重调，不要跳过。
-            ⚠️  运行时错误（final_error 且无 error_type）：记录失败继续下一项。
-            ⚠️  already_exists：跳过该项，不要重试。
-
-            关键参数规则：
-            - generate_entity 必须用 "class_name" 键（不是 entity_name），fields 里不要包含 id 字段
-            - generate_dubbo_interface 的 methods 必须是 dict 列表: [{{name, return_type, params:[{{name,type}}]}}]
-            - generate_rest_controller 必须用 "controller_name" 键，endpoints 用 http_method/path/method_name
-
-            技能调用顺序（每个模块依次执行）:
-              1. create_spring_boot_module
-            2. generate_dubbo_interface
-            3. generate_entity（如有 JPA 实体）
-            4. generate_dto（如有 DTO 类型的 endpoint 参数）
-            5. generate_rest_controller
-            6. add_threadpool_config（仅 has_threadpool=true）
-
-            所有调用都包含 project_name='{project_name}'。
+ 
+            ⚠️  project_name = "{project_name}" — 所有 skill 调用必须使用此值。
+            ⚠️  参数错误（error_type=param_error）：修正后立即重调，不要跳过。
+            ⚠️  already_exists：跳过，不要重试。
+            ⚠️  运行时错误（final_error 无 error_type）：记录后继续下一项。
+ 
+            【DTO 强制规则】
+            在调用 generate_rest_controller 之前，必须检查：
+            - 该模块所有 endpoint 的 param type
+            - 该模块 Dubbo interface 所有 method 的 param type
+            对每一个非 Java 基础类型、非 String 的类型（如 OrderDTO、UserDTO、
+            LoginRequest、CreateOrderRequest 等），必须先调用 generate_dto 生成该类。
+            DTO 所在模块 = 使用该类型的模块（OrderDTO 在 order-service，UserDTO 在 user-service）。
+            跳过 generate_dto 会导致编译失败，这是强制要求。
+ 
+            【Consumer 强制规则】
+            如果某模块需要调用其他模块的 Dubbo 服务，调用 generate_rest_controller 时
+            必须传入 dubbo_ref：
+              dubbo_ref = {{
+                "interface": "<provider 的 interface_fqn>",
+                "field_name": "<controller 中的 camelCase 字段名>"
+              }}
+            skill 会自动将 provider 注入 consumer 的 pom.xml，无需额外操作。
+ 
+            技能调用顺序（每个模块严格按序执行）:
+              1. create_spring_boot_module（不传 port，从返回值读 assigned_port）
+              2. generate_dubbo_interface（如有 Dubbo 服务）
+              3. generate_entity（如有 JPA 实体）
+              4. generate_dto（所有自定义类型，逐个调用，不可跳过）
+              5. generate_rest_controller（consumer 模块必须带 dubbo_ref）
+              6. add_threadpool_config（仅 has_threadpool=true）
+ 
+            所有调用包含 project_name='{project_name}'。
         """),
         expected_output="List of created files or skip reasons per module.",
         agent=agents["code_generator"],

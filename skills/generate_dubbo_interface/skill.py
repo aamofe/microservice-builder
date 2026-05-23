@@ -1,10 +1,10 @@
 """
 skills/generate_dubbo_interface/skill.py
-Generates a Dubbo service interface + implementation class for a given module.
 
-Fix (v2):
-- _normalize_methods(): LLM 有时将 methods 传为字符串列表 ["login","register"]
-  或混合格式，统一转换为 {name, return_type, params} 字典格式，防止 AttributeError
+v3 变更：
+- _collect_imports() 新增自定义类型解析：
+  短类名（无 '.'，非基础类型）按约定推断为 <base_package>.dto.<Type>
+  解决 UserDto / LoginDto 等 DTO 在 interface 和 impl 里缺少 import 的编译错误
 """
 
 from __future__ import annotations
@@ -18,35 +18,38 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# 永远不需要 import 的类型
+_NO_IMPORT = {
+    "void", "boolean", "byte", "short", "int", "long", "float", "double", "char",
+    "String", "Object", "Boolean", "Byte", "Short", "Integer", "Long",
+    "Float", "Double", "Character", "Void",
+}
+
+# 标准库类型映射
+_STD_IMPORT_MAP = {
+    "List":              "java.util.List",
+    "Map":               "java.util.Map",
+    "Set":               "java.util.Set",
+    "Optional":          "java.util.Optional",
+    "LocalDate":         "java.time.LocalDate",
+    "LocalDateTime":     "java.time.LocalDateTime",
+    "BigDecimal":        "java.math.BigDecimal",
+    "CompletableFuture": "java.util.concurrent.CompletableFuture",
+}
+
 
 def _normalize_methods(methods: list) -> list[dict]:
-    """
-    将 LLM 可能传来的各种格式统一为标准字典格式:
-      {name: str, return_type: str, params: list[{name: str, type: str}]}
-
-    支持的输入格式:
-      - str:  "login"  →  {name: "login", return_type: "void", params: []}
-      - dict: 已是标准格式，补全缺失字段
-    """
     normalized = []
     for m in methods:
         if isinstance(m, str):
-            # LLM 只传了方法名字符串
-            normalized.append({
-                "name": m.strip(),
-                "return_type": "void",
-                "params": [],
-            })
+            normalized.append({"name": m.strip(), "return_type": "void", "params": []})
         elif isinstance(m, dict):
-            # 补全可能缺失的字段
             entry = {
                 "name": m.get("name", "unknown"),
                 "return_type": m.get("return_type", "void"),
                 "params": [],
             }
-            # params 本身也可能是字符串列表，做同样防御
-            raw_params = m.get("params", [])
-            for p in raw_params:
+            for p in m.get("params", []):
                 if isinstance(p, str):
                     entry["params"].append({"name": p, "type": "Object"})
                 elif isinstance(p, dict):
@@ -60,22 +63,64 @@ def _normalize_methods(methods: list) -> list[dict]:
     return normalized
 
 
+def _collect_imports(methods: list, base_package: str = "") -> list[str]:
+    """
+    收集 interface / impl 所需的所有 import。
+
+    规则：
+    - 标准库短名（List、Map 等）→ 查 _STD_IMPORT_MAP
+    - 自定义短类名（无 '.'，非基础类型）→ <base_package>.dto.<Type>
+    - 已含 '.' 的 FQN → 直接使用
+    - 基础类型 / String / Object 等 → 跳过
+    """
+    needed: dict[str, str] = {}  # simple_name → fqn，用于去重
+
+    def _add(type_str: str):
+        # 提取尖括号前的主类名，如 List<UserDto> → List, UserDto
+        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", type_str)
+        for token in tokens:
+            if token in _NO_IMPORT or token in needed:
+                continue
+            if token in _STD_IMPORT_MAP:
+                needed[token] = _STD_IMPORT_MAP[token]
+            elif "." not in token:
+                # 自定义类型，推断为 dto 包
+                if base_package:
+                    fqn = f"{base_package}.dto.{token}"
+                    needed[token] = fqn
+                    logger.debug(f"_collect_imports: resolved '{token}' → '{fqn}'")
+                else:
+                    logger.warning(f"_collect_imports: cannot resolve '{token}' without base_package")
+            else:
+                # 已经是 FQN
+                needed[token] = token
+
+    for m in methods:
+        _add(m.get("return_type", ""))
+        for p in m.get("params", []):
+            _add(p.get("type", ""))
+
+    return sorted(needed.values())
+
+
 def run(params: dict, context: ProjectContext) -> dict:
     module_name: str = params["module_name"]
-    interface_name: str = params["interface_name"]   # e.g. "UserService"
-    methods: list = params.get("methods", [])        # [{name, return_type, params:[{name,type}]}]
+    interface_name: str = params["interface_name"]
+    methods: list = params.get("methods", [])
     version: str = params.get("version", "1.0.0")
     group: str = params.get("group", "default")
     has_threadpool: bool = params.get("has_threadpool", False)
 
-    # ── 关键修复：规范化 methods，防止 LLM 传字符串导致 AttributeError ──
     methods = _normalize_methods(methods)
     if not methods:
-        logger.warning(f"generate_dubbo_interface: no valid methods after normalization")
+        logger.warning("generate_dubbo_interface: no valid methods after normalization")
 
     module_info = context.modules.get(module_name)
     if not module_info:
-        return {"status": "error", "message": f"Module '{module_name}' not found in context. Create it first."}
+        return {
+            "status": "error",
+            "message": f"Module '{module_name}' not found in context. Create it first.",
+        }
 
     base_package = module_info.base_package
     api_package = base_package + ".api"
@@ -84,7 +129,6 @@ def run(params: dict, context: ProjectContext) -> dict:
 
     engine = get_engine()
     module_path = context.module_path(module_name)
-
     src_root = module_path / "src" / "main" / "java"
 
     def pkg_to_path(pkg: str) -> Path:
@@ -95,7 +139,8 @@ def run(params: dict, context: ProjectContext) -> dict:
     impl_dir = pkg_to_path(impl_package)
     impl_dir.mkdir(parents=True, exist_ok=True)
 
-    imports = _collect_imports(methods)
+    # ★ 传入 base_package，让 _collect_imports 能解析自定义 DTO 类型
+    imports = _collect_imports(methods, base_package)
 
     # --- Interface ---
     iface_ctx = {
@@ -150,29 +195,3 @@ def run(params: dict, context: ProjectContext) -> dict:
             str(impl_dir / f"{impl_class}.java"),
         ],
     }
-
-
-def _collect_imports(methods: list) -> list[str]:
-    """Scan method signatures for types that may need imports.
-    methods 此时已经过 _normalize_methods()，保证每项都是 dict。
-    """
-    type_import_map = {
-        "List": "java.util.List",
-        "Map": "java.util.Map",
-        "Set": "java.util.Set",
-        "Optional": "java.util.Optional",
-        "LocalDate": "java.time.LocalDate",
-        "LocalDateTime": "java.time.LocalDateTime",
-        "BigDecimal": "java.math.BigDecimal",
-        "CompletableFuture": "java.util.concurrent.CompletableFuture",
-    }
-    needed = set()
-    for m in methods:
-        for token in re.findall(r"[A-Za-z]+", m.get("return_type", "")):
-            if token in type_import_map:
-                needed.add(type_import_map[token])
-        for p in m.get("params", []):
-            for token in re.findall(r"[A-Za-z]+", p.get("type", "")):
-                if token in type_import_map:
-                    needed.add(type_import_map[token])
-    return sorted(needed)

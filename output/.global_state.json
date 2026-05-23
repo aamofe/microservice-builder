@@ -1,0 +1,8 @@
+{
+  "nacos": {
+    "running": true,
+    "compose_file": "external (detected via docker inspect)",
+    "network": "microservice-net",
+    "marked_at": "2026-05-23T10:30:59.388759"
+  }
+}
