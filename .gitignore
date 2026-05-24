@@ -6,8 +6,8 @@ dist/
 build/
 .venv/
 venv/
-log.txt
-output/*/
+log*.txt
+output*/
 logs/
 *.db
 .DS_Store

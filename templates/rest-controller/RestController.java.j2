@@ -2,6 +2,9 @@ package {{ package }};
 
 import org.springframework.web.bind.annotation.*;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.HttpStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 {% if dubbo_ref %}
 import org.apache.dubbo.config.annotation.DubboReference;
 {% endif %}
@@ -17,21 +20,25 @@ import {{ imp }};
 @RequestMapping("{{ base_path }}")
 public class {{ class_name }} {
 
+    private static final Logger log = LoggerFactory.getLogger({{ class_name }}.class);
+
 {% if dubbo_ref %}
-    @DubboReference(version = "{{ dubbo_version }}", group = "{{ dubbo_group }}")
+    @DubboReference(version = "{{ dubbo_version }}", group = "{{ dubbo_group }}", check = false)
     private {{ dubbo_ref.interface.split('.')[-1] }} {{ dubbo_ref.field_name }};
 
 {% endif %}
 {% for ep in endpoints %}
     /**
-     * {{ ep.http_method | default(ep.method) | upper }} {{ base_path }}{{ ep.path | default('') }}
+     * {{ ep.http_method | upper }} {{ base_path }}{{ ep.path | default('') }}
      * {{ ep.description | default('') }}
+{% for param in ep.params | default([]) %}
+     * @param {{ param.name }} {{ param.type }}
+{% endfor %}
      */
-    @{{ ep.http_method | default(ep.method) | capitalize }}Mapping("{{ ep.path | default('') }}")
-    public ResponseEntity<{{ ep.response_type | default('Object') }}> {{ ep.method_name | default(ep.handler_name) | default('handle') }}(
+    @{{ ep.http_method }}Mapping("{{ ep.path | default('') }}")
+    public ResponseEntity<{{ ep.response_type | default('Object') }}> {{ ep.method_name }}(
 {%- set ep_params = ep.params | default([]) %}
 {%- if ep_params %}
-
 {% for param in ep_params %}
 {%- if param.source | default('query') == 'body' %}
             @RequestBody {{ param.type }} {{ param.name }}
@@ -41,16 +48,68 @@ public class {{ class_name }} {
             @RequestParam(required = false) {{ param.type }} {{ param.name }}
 {%- endif %}
 {%- if not loop.last %},{% endif %}
-
 {% endfor %}
     ) {
-{% else %}) {
+{% else %}
+) {
 {% endif %}
-        // TODO: implement {{ ep.method_name | default(ep.handler_name) | default('handle') }}
-{% if dubbo_ref %}
-        // Delegate to: {{ dubbo_ref.field_name }}.{{ ep.method_name | default(ep.handler_name) | default('handle') }}(...)
+        log.info("[{{ class_name }}] {{ ep.method_name }} called
+{%- if ep_params %} with:
+{%- for param in ep_params %} {{ param.name }}={}
+{%- endfor %}
+{%- endif %}
+"
+{%- if ep_params %}
+{%- for param in ep_params %}, {{ param.name }}
+{%- endfor %}
+{%- endif %}
+);
+{% for param in ep_params %}
+{% if param.type not in ('int', 'long', 'double', 'float', 'boolean') and param.source | default('query') != 'path' %}
+        if ({{ param.name }} == null) {
+            log.warn("[{{ class_name }}] {{ ep.method_name }}: {{ param.name }} is null");
+            return ResponseEntity.badRequest().build();
+        }
 {% endif %}
-        return ResponseEntity.ok(null);
+{% endfor %}
+        try {
+{% if dubbo_ref and ep.dubbo_call is defined %}
+{%- set call = ep.dubbo_call %}
+{%- if call.matched %}
+            // Dubbo RPC → {{ dubbo_ref.interface.split('.')[-1] }}.{{ call.method_name }}
+{%- set ep_arg_names %}{% for p in ep_params %}{{ p.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% endset %}
+            {{ ep.response_type | default('Object') }} result = {{ dubbo_ref.field_name }}.{{ call.method_name }}({{ ep_arg_names }});
+            if (result == null) {
+                log.warn("[{{ class_name }}] {{ ep.method_name }}: service returned null");
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+            }
+            return ResponseEntity.ok(result);
+{%- else %}
+            // TODO: No exact type match found between this endpoint and {{ dubbo_ref.interface.split('.')[-1] }}.
+            // Available methods in {{ dubbo_ref.interface.split('.')[-1] }}:
+{%- for m in call.iface_methods %}
+            //   {{ m.return_type }} {{ m.name }}({% for p in m.params %}{{ p.type }} {{ p.name }}{% if not loop.last %}, {% endif %}{% endfor %})
+{%- endfor %}
+            // Please manually wire the correct call, e.g.:
+            //   boolean valid = {{ dubbo_ref.field_name }}.{{ call.iface_methods[0].name if call.iface_methods else 'someMethod' }}(...);
+            throw new UnsupportedOperationException("{{ ep.method_name }}: dubbo call not auto-wired, see TODO above");
+{%- endif %}
+{% elif dubbo_ref %}
+            // TODO: dubbo_call metadata unavailable, wire manually
+            throw new UnsupportedOperationException("{{ ep.method_name }} not yet implemented");
+{% else %}
+            // TODO: inject and call your service layer here
+            // {{ ep.response_type | default('Object') }} result = someService.{{ ep.method_name }}(
+{%- for p in ep_params %}{{ p.name }}{% if not loop.last %}, {% endif %}{% endfor %});
+            // return ResponseEntity.ok(result);
+            throw new UnsupportedOperationException("{{ ep.method_name }} not yet implemented");
+{% endif %}
+        } catch (UnsupportedOperationException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("[{{ class_name }}] {{ ep.method_name }} failed: {}", e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
     }
 
 {% endfor %}
